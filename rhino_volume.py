@@ -94,6 +94,7 @@ def brep_volume(brep):
     """Exact volume of a closed Brep whose faces are all flat with straight edges."""
     if not brep.IsSolid:
         return None
+    centre = xyz(brep.GetBoundingBox().Center)
     total = 0.0
     for fi in range(len(brep.Faces)):
         face = brep.Faces[fi]
@@ -115,19 +116,23 @@ def brep_volume(brep):
             n = newell(pts)
             if face.OrientationIsReversed:
                 n = (-n[0], -n[1], -n[2])
-            total += dot(pts[0], n)
+            total += dot(sub(pts[0], centre), n)
     return abs(total) / 6.0
 
 
-def mesh_volume(mesh):
+def mesh_volume(mesh, centre):
+    """Signed volume, with tetrahedra measured from a point near the object.
+
+    Measuring from the world origin instead loses all precision at map
+    coordinates (NYC state plane is ~1,000,000 ft from the origin)."""
     total = 0.0
     v = mesh.Vertices
     for i in range(len(mesh.Faces)):
         f = mesh.Faces[i]
-        a, b, c = xyz(v[f[0]]), xyz(v[f[1]]), xyz(v[f[2]])
+        a, b, c = (sub(xyz(v[f[k]]), centre) for k in range(3))
         total += dot(a, cross(b, c))
         if f[2] != f[3]:
-            d = xyz(v[f[3]])
+            d = sub(xyz(v[f[3]]), centre)
             total += dot(a, cross(c, d))
     return total / 6.0
 
@@ -314,23 +319,26 @@ def object_volume(geom):
         vol = extrusion_volume(geom)
         if vol is not None:
             return vol
-        meshes = [geom.GetMesh(r3.MeshType.Any)]
+        meshes = [(geom.GetMesh(r3.MeshType.Any), 1)]
     elif isinstance(geom, r3.Brep):
         vol = brep_volume(geom)
         if vol is not None:
             return vol
         if not geom.IsSolid:
             return None
-        meshes = [geom.Faces[i].GetMesh(r3.MeshType.Any) for i in range(len(geom.Faces))]
+        # A face's render mesh follows the surface, not the solid, so flip reversed faces.
+        meshes = [(geom.Faces[i].GetMesh(r3.MeshType.Any), -1 if geom.Faces[i].OrientationIsReversed else 1)
+                  for i in range(len(geom.Faces))]
     elif isinstance(geom, r3.Mesh):
         if not geom.IsClosed:
             return None
-        meshes = [geom]
+        meshes = [(geom, 1)]
     else:
         return None
-    if not meshes or any(m is None for m in meshes):
+    if not meshes or any(m is None for m, _ in meshes):
         return None
-    return abs(sum(mesh_volume(m) for m in meshes))
+    centre = xyz(geom.GetBoundingBox().Center)
+    return abs(sum(s * mesh_volume(m, centre) for m, s in meshes))
 
 
 def main():
