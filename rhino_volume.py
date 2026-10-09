@@ -16,17 +16,18 @@ How each object is measured:
 Objects that can't be measured (open surfaces, curved Breps saved without
 render meshes, curves, text...) are counted as "skipped" and reported.
 
-Roof / base mode (--roof-layer and --base-layer): every surface on the roof
-layer is a prism from z=0 up to that surface, every surface on the base layer
-is a prism from z=0 up to the ground, and the building volume is the
-difference. Walls are not needed, and it does not matter which way the
-surfaces face. Assumes roofs don't overhang each other when seen from above.
+Roof / base mode (--roof-layer and --base-layer): the plan is cut into a fine
+grid (1 ft by default), and each cell adds (highest roof - ground) x cell area.
+Walls are not needed and it does not matter which way surfaces face. Where roof
+surfaces overlap in plan, only the highest one counts, and a footprint stored
+twice counts once.
 """
 import argparse
 import csv
 import sys
 from collections import defaultdict
 
+import numpy as np
 import rhino3dm as r3
 
 # Conversion from the model's unit to cubic metres, by rhino3dm UnitSystem name.
@@ -210,6 +211,104 @@ def surfaces_prism(geom):
     return None
 
 
+def mesh_triangles(mesh):
+    v = mesh.Vertices
+    out = []
+    for i in range(len(mesh.Faces)):
+        f = mesh.Faces[i]
+        out.append([xyz(v[f[0]]), xyz(v[f[1]]), xyz(v[f[2]])])
+        if f[2] != f[3]:
+            out.append([xyz(v[f[0]]), xyz(v[f[2]]), xyz(v[f[3]])])
+    return out
+
+
+def surface_triangles(geom):
+    """Triangles covering a surface object, from its render mesh, or None."""
+    if isinstance(geom, r3.Extrusion):
+        geom = geom.ToBrep(False)
+    if isinstance(geom, r3.Mesh):
+        return mesh_triangles(geom)
+    if not isinstance(geom, r3.Brep) or geom.IsSolid:
+        return None
+    out = []
+    for fi in range(len(geom.Faces)):
+        face = geom.Faces[fi]
+        mesh = face.GetMesh(r3.MeshType.Any)
+        if mesh is not None:
+            out.extend(mesh_triangles(mesh))
+            continue
+        # No render mesh saved: a single straight-edged convex loop can be fanned.
+        loops = list(face.Loops)
+        if len(loops) != 1:
+            return None
+        pts = []
+        for trim in loops[0].Trims:
+            if trim.EdgeIndex < 0:
+                continue
+            edge_pts = curve_points(geom.Edges[trim.EdgeIndex])
+            if edge_pts is None:
+                return None
+            if trim.IsReversed:
+                edge_pts = edge_pts[::-1]
+            pts.extend(edge_pts[:-1])
+        signs = {prism([pts[i - 1], pts[i], pts[(i + 1) % len(pts)]])[0] > 0 for i in range(len(pts))}
+        if len(pts) < 3 or len(signs) != 1:
+            return None
+        out.extend([pts[0], pts[i], pts[i + 1]] for i in range(1, len(pts) - 1))
+    return out
+
+
+def rasterize(tris, cell, origin, take_max):
+    """Height per grid cell (cell centres) over a set of triangles.
+
+    Returns (cell keys, heights): the highest triangle over each cell if take_max,
+    else the lowest."""
+    keys, zs = [], []
+    for t in tris:
+        (x0, y0, z0), (x1, y1, z1), (x2, y2, z2) = t
+        d = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if abs(d) < 1e-12:
+            continue  # vertical or degenerate: covers no area seen from above
+        ix = np.arange(np.ceil((min(x0, x1, x2) - origin[0]) / cell - 0.5),
+                       np.floor((max(x0, x1, x2) - origin[0]) / cell - 0.5) + 1)
+        iy = np.arange(np.ceil((min(y0, y1, y2) - origin[1]) / cell - 0.5),
+                       np.floor((max(y0, y1, y2) - origin[1]) / cell - 0.5) + 1)
+        if not len(ix) or not len(iy):
+            continue
+        gx, gy = np.meshgrid(ix, iy)
+        px = origin[0] + (gx.ravel() + 0.5) * cell
+        py = origin[1] + (gy.ravel() + 0.5) * cell
+        a = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / d
+        b = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / d
+        c = 1 - a - b
+        inside = (a >= 0) & (b >= 0) & (c > 0)  # half-open, so shared edges count once
+        keys.append(gx.ravel()[inside].astype(np.int64) * (1 << 32) + gy.ravel()[inside].astype(np.int64))
+        zs.append((a * z0 + b * z1 + c * z2)[inside])
+    if not keys:
+        return np.zeros(0, np.int64), np.zeros(0)
+    keys, zs = np.concatenate(keys), np.concatenate(zs)
+    order = np.lexsort((-zs if take_max else zs, keys))
+    keys, zs = keys[order], zs[order]
+    first = np.r_[True, keys[1:] != keys[:-1]]
+    return keys[first], zs[first]
+
+
+def envelope_volume(roof_tris, base_tris, cell):
+    """Volume between the highest roof and the ground, on a grid of square cells.
+
+    Overlapping roofs (a roof surface stacked over another) and duplicated
+    footprints are each counted once. Returns (volume, roof cells without a base,
+    base cells without a roof) with the last two as areas."""
+    allpts = np.array([p for t in roof_tris + base_tris for p in t])
+    origin = allpts[:, :2].min(0)
+    rk, rz = rasterize(roof_tris, cell, origin, take_max=True)
+    bk, bz = rasterize(base_tris, cell, origin, take_max=False)
+    both, ri, bi = np.intersect1d(rk, bk, assume_unique=True, return_indices=True)
+    h = rz[ri] - bz[bi]
+    area = cell * cell
+    return float(h.sum() * area), (len(rk) - len(both)) * area, (len(bk) - len(both)) * area
+
+
 def object_volume(geom):
     if isinstance(geom, r3.Extrusion):
         vol = extrusion_volume(geom)
@@ -242,6 +341,8 @@ def main():
                     help="add up sub-layers into their top-level layer (e.g. all of Buildings::*)")
     ap.add_argument("--roof-layer", help="layer holding roof surfaces (roof / base mode, see above)")
     ap.add_argument("--base-layer", help="layer holding footprint / ground surfaces (roof / base mode)")
+    ap.add_argument("--cell", type=float,
+                    help="grid size for roof / base mode, in model units (default: 1 ft)")
     args = ap.parse_args()
     if bool(args.roof_layer) != bool(args.base_layer):
         ap.error("--roof-layer and --base-layer go together")
@@ -259,6 +360,7 @@ def main():
         sys.exit(f"No layer called {missing[0]!r}. Layers in this file:\n  " + "\n  ".join(sorted(layers.values())))
     # [projected area, area x height, surfaces used, surfaces skipped] for roof and base
     prisms = {args.roof_layer: [0.0, 0.0, 0, 0], args.base_layer: [0.0, 0.0, 0, 0]}
+    triangles = {args.roof_layer: [], args.base_layer: []}
 
     vol = defaultdict(float)
     counted = defaultdict(int)
@@ -268,11 +370,13 @@ def main():
         layer = layers.get(obj.Attributes.LayerIndex, "(unknown layer)")
         if args.roof_layer and layer in prisms:
             p = surfaces_prism(obj.Geometry)
+            t = surface_triangles(obj.Geometry)
             acc = prisms[layer]
-            if p is None:
+            if p is None or t is None:
                 acc[3] += 1
             else:
                 acc[0] += p[0]; acc[1] += p[1]; acc[2] += 1
+                triangles[layer].extend(t)
         if args.top_level:
             layer = layer.split("::")[0]
         v = object_volume(obj.Geometry)
@@ -302,15 +406,17 @@ def main():
 
     if args.roof_layer:
         roof, base = prisms[args.roof_layer], prisms[args.base_layer]
+        cell = args.cell or 0.3048 / TO_METRES.get(unit, 1.0)  # 1 ft by default
+        print(f"\nWorking out roof / base volume on a {cell:g} {unit.lower()} grid...", flush=True)
+        ev, roof_only, base_only = envelope_volume(triangles[args.roof_layer], triangles[args.base_layer], cell)
         pv = roof[1] - base[1]
-        print(f"\nROOF / BASE VOLUME: {pv * to_m3:,.0f} m3  ({pv:,.0f} cubic {unit.lower()})")
-        print(f"  roofs: {roof[2]:,} surfaces, {roof[0] * to_m3 ** (2 / 3):,.0f} m2 seen from above"
-              f" ({roof[3]:,} skipped)")
-        print(f"  bases: {base[2]:,} surfaces, {base[0] * to_m3 ** (2 / 3):,.0f} m2 seen from above"
-              f" ({base[3]:,} skipped)")
-        if base[0] and abs(roof[0] / base[0] - 1) > 0.05:
-            print("  Warning: roof and base areas differ by more than 5%, so some buildings may be"
-                  " missing a roof or a base, or roofs overlap.")
+        a2 = to_m3 ** (2 / 3)
+        print(f"ROOF / BASE VOLUME: {ev * to_m3:,.0f} m3  ({ev:,.0f} cubic {unit.lower()})")
+        print(f"  roofs: {roof[2]:,} surfaces, {roof[0] * a2:,.0f} m2 seen from above ({roof[3]:,} skipped)")
+        print(f"  bases: {base[2]:,} surfaces, {base[0] * a2:,.0f} m2 seen from above ({base[3]:,} skipped)")
+        print(f"  Adding up every roof without removing overlaps would give {pv * to_m3:,.0f} m3.")
+        print(f"  {roof_only * a2:,.0f} m2 of roof has no base under it and {base_only * a2:,.0f} m2 of base"
+              f" has no roof over it; neither counts.")
 
 
 if __name__ == "__main__":

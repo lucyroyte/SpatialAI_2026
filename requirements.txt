@@ -1,1 +1,2 @@
 rhino3dm>=8
+numpy

@@ -5,7 +5,7 @@
 `rhino_volume.py` adds up the volume of the objects in a Rhino `.3dm` file, per layer,
 without Rhino installed.
 
-**You need** Python 3.9 or newer and `rhino3dm`:
+**You need** Python 3.9 or newer, `rhino3dm` and `numpy`:
 
 ```
 pip install -r requirements.txt
@@ -25,6 +25,7 @@ units) and writes the same table to `volumes_by_layer.csv`. Options:
 | `--csv FILE` | Write the per-layer table somewhere else. |
 | `--top-level` | Add sub-layers into their top-level layer, so `Buildings::Facade` and `Buildings::Roof` show as one `Buildings` row. |
 | `--roof-layer LAYER --base-layer LAYER` | Roof / base mode, for models whose buildings are loose surfaces instead of closed solids (see below). |
+| `--cell SIZE` | Grid size for roof / base mode, in model units. Default 1 ft. Use a smaller one for a small model. |
 
 The per-layer table only measures closed objects: extrusions, closed polysurfaces and
 closed meshes. Open surfaces, curves and text are listed as "skipped".
@@ -41,11 +42,19 @@ python rhino_volume.py NYC_3DModel_MN01.3dm --top-level \
     --base-layer "Buildings::FootPrint Surface"
 ```
 
-This measures the space between each roof and the ground under it: every roof surface
-is a prism down to z=0, every footprint is a prism down to z=0, and the volume is the
-difference. Facades aren't needed. The script also prints the roof and footprint areas
-seen from above; they should be close, and it warns if they differ by more than 5%.
-It assumes no building has a roof overhanging another roof (true for this model, where
-the two areas agree to within 2%).
+This cuts the plan into a 1 ft grid and adds up, cell by cell, the height from the
+footprint to the highest roof above it. Facades aren't needed. Where roof surfaces of
+one building overlap in plan (about 60 buildings in MN01 to MN03), only the highest
+counts, and a footprint stored twice (4 in MN01) counts once. The script also prints
+what adding up every roof without that correction would give, and how much roof or
+footprint area has nothing above or below it.
 
-A 370 MB borough district file takes about 30 seconds.
+Results (matching the separate per-building calculation in this project to within 0.01%):
+
+| District | Building volume |
+| --- | --- |
+| MN01 | 66.2M m³ |
+| MN02 | 39.3M m³ |
+| MN03 | 26.6M m³ |
+
+A 370 to 560 MB district file takes one to two minutes.
