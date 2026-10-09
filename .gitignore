@@ -1,0 +1,4 @@
+*.3dm
+*.zip
+volumes_by_layer.csv
+__pycache__/
